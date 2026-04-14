@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Music Release Reporter</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Playfair+Display:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+
+
+    <script type="text/babel">
+      const { useEffect, useMemo, useState } = React;
+
+      function App() {
+        const [songs, setSongs] = useState([]);
+        const [reports, setReports] = useState([]);
+        const [status, setStatus] = useState("Ready");
+        const [selectedPreview, setSelectedPreview] = useState("");
+        const [chatHistory, setChatHistory] = useState([
+          {
+            role: "assistant",
+            text: "Upload song data, generate reports, then ask questions about campaign performance.",
+          },
+        ]);
+
+        const [songForm, setSongForm] = useState({
+          title: "",
+          spotify_link: "",
+          release_date: "",
+        });
+
+        const [csvUpload, setCsvUpload] = useState({ songId: "", file: null });
+        const [referencePdf, setReferencePdf] = useState(null);
+        const [chatQuestion, setChatQuestion] = useState("");
+
+        const songOptions = useMemo(() => songs.map((song) => ({ id: song.id, title: song.title })), [songs]);
+
+        useEffect(() => {
+          refreshData();
+        }, []);
+
+        async function request(url, options = {}) {
+          const response = await fetch(url, options);
+          const text = await response.text();
+          let payload = {};
+          if (text) {
+            try {
+              payload = JSON.parse(text);
+            } catch (_error) {
+              payload = { message: text };
+            }
+          }
+          if (!response.ok) {
+            throw new Error(payload.detail || payload.message || "Request failed");
+          }
+          return payload;
+        }
+
+        async function refreshData() {
+          try {
+            const [songData, reportData] = await Promise.all([request("/api/songs"), request("/api/reports")]);
+            setSongs(songData);
+            setReports(reportData);
+            if (!selectedPreview && reportData.length > 0 && reportData[0].pdf_url) {
+              setSelectedPreview(reportData[0].pdf_url);
+            }
+            setStatus("Dashboard updated");
+          } catch (error) {
+            setStatus(`Refresh failed: ${error.message}`);
+          }
+        }
+
+        async function submitSong(event) {
+          event.preventDefault();
+          try {
+            setStatus("Creating song profile...");
+            await request("/api/songs", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(songForm),
+            });
+            setSongForm({ title: "", spotify_link: "", release_date: "" });
+            setStatus("Song profile created");
+            await refreshData();
+          } catch (error) {
+            setStatus(`Song creation failed: ${error.message}`);
+          }
+        }
+
+        async function submitCsv(event) {
+          event.preventDefault();
+          if (!csvUpload.songId || !csvUpload.file) {
+            setStatus("Choose a song and CSV file first");
+            return;
+          }
+
+          try {
+            setStatus("Uploading and parsing CSV...");
+            const formData = new FormData();
+            formData.append("file", csvUpload.file);
+            const result = await request(`/api/songs/${csvUpload.songId}/upload-csv`, {
+              method: "POST",
+              body: formData,
+            });
+            const warningCount = result.warnings ? result.warnings.length : 0;
+            setStatus(`CSV processed: ${result.rows_loaded} rows (${warningCount} warnings)`);
+            setCsvUpload((current) => ({ ...current, file: null }));
+            document.getElementById("csv-file-input").value = "";
+            await refreshData();
+          } catch (error) {
+            setStatus(`CSV upload failed: ${error.message}`);
+          }
+        }
+
+        async function generateReport(songId) {
+          try {
+            setStatus("Generating PDF report...");
+            const result = await request(`/api/songs/${songId}/generate-report`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({}),
+            });
+            if (result.pdf_url) {
+              setSelectedPreview(result.pdf_url);
+            }
+            setStatus(`Report ready: ${result.report_label || "PDF created"}`);
+            await refreshData();
+          } catch (error) {
+            setStatus(`Report generation failed: ${error.message}`);
+          }
+        }
+
+        async function uploadReferencePdf(event) {
+          event.preventDefault();
+          if (!referencePdf) {
+            setStatus("Pick a PDF to upload into chat knowledge");
+            return;
+          }
+
+          try {
+            setStatus("Indexing reference PDF...");
+            const formData = new FormData();
+            formData.append("file", referencePdf);
+            const result = await request("/api/reports/upload-pdf", { method: "POST", body: formData });
+            setStatus(`Indexed PDF with ${result.characters_indexed} characters`);
+            document.getElementById("pdf-upload-input").value = "";
+            setReferencePdf(null);
+          } catch (error) {
+            setStatus(`PDF indexing failed: ${error.message}`);
+          }
+        }
+
+        async function submitChat(event) {
+          event.preventDefault();
+          if (!chatQuestion.trim()) {
+            return;
+          }
+
+          const prompt = chatQuestion.trim();
+          setChatQuestion("");
+          setChatHistory((history) => [...history, { role: "user", text: prompt }]);
+
+          try {
+            setStatus("Asking chatbot...");
+            const result = await request("/api/chat", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ question: prompt }),
+            });
+            setChatHistory((history) => [...history, { role: "assistant", text: result.answer }]);
+            setStatus("Chatbot answered");
+          } catch (error) {
+            setChatHistory((history) => [
+              ...history,
+              { role: "assistant", text: `Chat failed: ${error.message}` },
+            ]);
+            setStatus(`Chat error: ${error.message}`);
+          }
+        }
+
+        return (
+          <div className="page-shell">
+            <header className="hero">
+              <div>
+                <p className="kicker">Local Analytics Studio</p>
+                <h1>Music Release Reporter</h1>
+                <p className="hero-subtitle">
+                  Upload campaign CSVs, generate executive-ready PDFs, and query historical reports with Cohere-backed chat.
+                </p>
+              </div>
+              <div className="status-pill">{status}</div>
+            </header>
+
+            <main className="grid-layout">
+              <section className="panel">
+                <h2>Add Song</h2>
+                <form onSubmit={submitSong} className="form-stack">
+                  <input
+                    placeholder="Song title"
+                    value={songForm.title}
+                    onChange={(event) => setSongForm({ ...songForm, title: event.target.value })}
+                    required
+                  />
+                  <input
+                    placeholder="Spotify link"
+                    value={songForm.spotify_link}
+                    onChange={(event) => setSongForm({ ...songForm, spotify_link: event.target.value })}
+                    required
+                  />
+                  <input
+                    type="date"
+                    value={songForm.release_date}
+                    onChange={(event) => setSongForm({ ...songForm, release_date: event.target.value })}
+                    required
+                  />
+                  <button type="submit">Create Song</button>
+                </form>
+              </section>
+
+              <section className="panel">
+                <h2>Upload CSV</h2>
+                <form onSubmit={submitCsv} className="form-stack">
+                  <select
+                    value={csvUpload.songId}
+                    onChange={(event) => setCsvUpload({ ...csvUpload, songId: event.target.value })}
+                    required
+                  >
+                    <option value="">Select song</option>
+                    {songOptions.map((song) => (
+                      <option key={song.id} value={song.id}>
+                        {song.title}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    id="csv-file-input"
+                    type="file"
+                    accept=".csv"
+                    onChange={(event) => setCsvUpload({ ...csvUpload, file: event.target.files?.[0] || null })}
+                    required
+                  />
+                  <button type="submit">Upload Metrics</button>
+                </form>
+              </section>
+
+              <section className="panel">
+                <h2>Upload Knowledge PDF</h2>
+                <p className="panel-caption">Use this for Q1 or legacy campaign decks before asking chat questions.</p>
+                <form onSubmit={uploadReferencePdf} className="form-stack">
+                  <input
+                    id="pdf-upload-input"
+                    type="file"
+                    accept=".pdf"
+                    onChange={(event) => setReferencePdf(event.target.files?.[0] || null)}
+                    required
+                  />
+                  <button type="submit">Index PDF for Chat</button>
+                </form>
+              </section>
+
+              <section className="panel panel-wide">
+                <h2>Song Pipeline</h2>
+                <div className="song-list">
+                  {songs.length === 0 && <p className="empty">No songs yet. Add your first release profile.</p>}
+                  {songs.map((song) => (
+                    <article key={song.id} className="song-card">
+                      <div>
+                        <h3>{song.title}</h3>
+                        <p className="song-meta">Release: {song.release_date}</p>
+                        <p className="song-meta">Spotify: {song.spotify_link}</p>
+                        {song.next_report && (
+                          <p className="song-due">
+                            Next: {song.next_report.label} ({song.next_report.status}) on {song.next_report.due_date || "n/a"}
+                          </p>
+                        )}
+                      </div>
+                      <button onClick={() => generateReport(song.id)}>Generate Due Report</button>
+                    </article>
+                  ))}
+                </div>
+              </section>
+
+              <section className="panel panel-wide">
+                <h2>Generated PDFs</h2>
+                <div className="reports-grid">
+                  <div className="report-list">
+                    {reports.length === 0 && <p className="empty">No reports generated yet.</p>}
+                    {reports.map((report) => (
+                      <button
+                        key={report.id}
+                        className="report-item"
+                        onClick={() => setSelectedPreview(report.pdf_url || "")}
+                      >
+                        <span>{report.song_title}</span>
+                        <span>{report.report_label}</span>
+                        <span>{new Date(report.generated_at).toLocaleString()}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="preview-pane">
+                    {selectedPreview ? (
+                      <>
+                        <a href={selectedPreview} target="_blank" rel="noreferrer" className="download-link">
+                          Open / Download PDF
+                        </a>
+                        <iframe src={selectedPreview} title="Report preview" />
+                      </>
+                    ) : (
+                      <p className="empty">Select a report to preview it.</p>
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              <section className="panel panel-wide">
+                <h2>Report Chat</h2>
+                <div className="chat-box">
+                  {chatHistory.map((entry, index) => (
+                    <div key={index} className={`chat-bubble ${entry.role}`}>
+                      {entry.text}
+                    </div>
+                  ))}
+                </div>
+                <form onSubmit={submitChat} className="chat-form">
+                  <input
+                    placeholder="Ask about cumulative streams, saves, skips, or report deadlines"
+                    value={chatQuestion}
+                    onChange={(event) => setChatQuestion(event.target.value)}
+                  />
+                  <button type="submit">Ask</button>
+                </form>
+              </section>
+            </main>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>

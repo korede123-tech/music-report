@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.venv/
+venv/
+.pytest_cache/
+logs/*.log
+data/
+reports/charts/
+reports/generated/
+sample_data/*.pdf
+.vercel/
