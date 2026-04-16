@@ -1,0 +1,10 @@
+{
+  "name": "music-release-reporter",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Script wrapper for local FastAPI development",
+  "scripts": {
+    "dev": "python -m uvicorn main:app --reload",
+    "start": "python -m uvicorn main:app --host 0.0.0.0 --port 8000"
+  }
+}

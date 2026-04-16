@@ -45,9 +45,17 @@ def _draw_summary_table(pdf: canvas.Canvas, summary: dict, width: float, height:
     table_x = 0.8 * inch
     table_y_top = height - 2.2 * inch
     table_w = width - 1.6 * inch
-    row_h = 0.48 * inch
+    row_h = 0.42 * inch
+
+    day1 = summary.get("day1_breakdown", {})
+    day1_dates = summary.get("day1_window_dates", [])
+    day1_date_label = " + ".join(day1_dates[:2]) if day1_dates else "release day + day 2"
 
     rows = [
+        (f"Day 1 Combined ({day1_date_label})", day1.get("combined_total", summary.get("cumulative_windows", {}).get("24h", 0))),
+        ("Day 1 Spotify Streams", day1.get("spotify_streams", 0)),
+        ("Day 1 Apple Music Streams", day1.get("apple_music_streams", 0)),
+        ("Day 1 Shazams", day1.get("number_of_shazams", 0)),
         ("24h Cumulative Streams", summary.get("cumulative_windows", {}).get("24h", 0)),
         ("3 Day Cumulative Streams", summary.get("cumulative_windows", {}).get("3d", 0)),
         ("7 Day Cumulative Streams", summary.get("cumulative_windows", {}).get("7d", 0)),
@@ -74,6 +82,15 @@ def _draw_summary_table(pdf: canvas.Canvas, summary: dict, width: float, height:
         pdf.setFont("Helvetica-Bold", 11)
         pdf.drawRightString(table_x + table_w - 0.18 * inch, y + 0.16 * inch, str(value))
         pdf.setFillColor(colors.HexColor("#1A1A1A"))
+
+    footer_y = table_y_top - (len(rows) + 1) * row_h - 0.05 * inch
+    pdf.setFillColor(SOFT_GOLD)
+    pdf.setFont("Helvetica-Oblique", 9)
+    pdf.drawString(
+        table_x,
+        max(0.55 * inch, footer_y),
+        "Day 1 rule: release-day + day-2 totals. Pre-release rows (for example release-1 date) are ignored.",
+    )
 
 
 def _draw_chart_page(pdf: canvas.Canvas, title: str, chart_path: str, width: float, height: float) -> None:

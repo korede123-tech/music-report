@@ -27,18 +27,33 @@
         const [reports, setReports] = useState([]);
         const [status, setStatus] = useState("Ready");
         const [selectedPreview, setSelectedPreview] = useState("");
+        const [isCreatingSong, setIsCreatingSong] = useState(false);
+        const [deletingSongId, setDeletingSongId] = useState(null);
+        const [chartSyncLoading, setChartSyncLoading] = useState(false);
+        const [chartmetricSyncLoading, setChartmetricSyncLoading] = useState(false);
+        const [integrationStatus, setIntegrationStatus] = useState({
+          spotify_credentials_configured: false,
+          charts_token_configured: false,
+          apify_token_configured: false,
+          warnings: [],
+        });
         const [chatHistory, setChatHistory] = useState([
           {
             role: "assistant",
-            text: "Upload song data, generate reports, then ask questions about campaign performance.",
+            text: "Ask about your uploaded reports.",
           },
         ]);
 
         const [songForm, setSongForm] = useState({
-          title: "",
-          spotify_link: "",
-          release_date: "",
+          spotify_input: "",
         });
+
+        const [chartRefsInput, setChartRefsInput] = useState("");
+        const [chartAppearances, setChartAppearances] = useState([]);
+        const [chartSongSummaries, setChartSongSummaries] = useState([]);
+        const [chartWarnings, setChartWarnings] = useState([]);
+        const [chartmetricProfiles, setChartmetricProfiles] = useState([]);
+        const [chartmetricWarnings, setChartmetricWarnings] = useState([]);
 
         const [csvUpload, setCsvUpload] = useState({ songId: "", file: null });
         const [referencePdf, setReferencePdf] = useState(null);
@@ -69,11 +84,28 @@
 
         async function refreshData() {
           try {
-            const [songData, reportData] = await Promise.all([request("/api/songs"), request("/api/reports")]);
+            const [songData, reportData, chartsData, chartmetricData, integrationData] = await Promise.all([
+              request("/api/songs"),
+              request("/api/reports"),
+              request("/api/charts/appearances"),
+              request("/api/chartmetric/profiles"),
+              request("/api/integrations/status"),
+            ]);
             setSongs(songData);
             setReports(reportData);
-            if (!selectedPreview && reportData.length > 0 && reportData[0].pdf_url) {
-              setSelectedPreview(reportData[0].pdf_url);
+            setChartAppearances(chartsData.items || []);
+            setChartmetricProfiles(chartmetricData.items || []);
+            setIntegrationStatus(integrationData || {});
+            const availableUrls = reportData
+              .map((report) => report.pdf_url)
+              .filter((url) => Boolean(url));
+
+            if (selectedPreview && !availableUrls.includes(selectedPreview)) {
+              setSelectedPreview("");
+            }
+
+            if ((!selectedPreview || !availableUrls.includes(selectedPreview)) && availableUrls.length > 0) {
+              setSelectedPreview(availableUrls[0]);
             }
             setStatus("Dashboard updated");
           } catch (error) {
@@ -81,32 +113,134 @@
           }
         }
 
+        async function runChartSync(event) {
+          event.preventDefault();
+          if (chartSyncLoading) {
+            return;
+          }
+
+          if (!integrationStatus.charts_token_configured && !integrationStatus.spotify_credentials_configured) {
+            const message =
+              "Charts sync requires SPOTIFY_CHARTS_ACCESS_TOKEN, or SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET for fallback.";
+            setChartWarnings([message]);
+            setStatus(message);
+            return;
+          }
+
+          const chartReferences = chartRefsInput
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0);
+
+          try {
+            setChartSyncLoading(true);
+            setStatus("Syncing Spotify Charts...");
+            const result = await request("/api/charts/sync", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chart_references: chartReferences,
+                from_release_date: true,
+                max_points_per_chart: 40,
+              }),
+            });
+
+            setChartSongSummaries(result.song_summaries || []);
+            setChartWarnings(result.warnings || []);
+            setStatus(
+              `Chart sync complete: ${result.total_matches || 0} match(es) across ${result.total_requests || 0} chart request(s)`
+            );
+            await refreshData();
+          } catch (error) {
+            setStatus(`Chart sync failed: ${error.message}`);
+          } finally {
+            setChartSyncLoading(false);
+          }
+        }
+
+        async function runChartmetricSync(event) {
+          event.preventDefault();
+          if (chartmetricSyncLoading) {
+            return;
+          }
+
+          if (!integrationStatus.apify_token_configured) {
+            const message = "Set APIFY_API_TOKEN in .env, then restart uvicorn to enable Chartmetric sync.";
+            setChartmetricWarnings([message]);
+            setStatus(message);
+            return;
+          }
+
+          try {
+            setChartmetricSyncLoading(true);
+            setStatus("Syncing Chartmetric insights via Apify...");
+            const result = await request("/api/chartmetric/sync", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ mode: "1", exact: "on" }),
+            });
+
+            setChartmetricWarnings(result.warnings || []);
+            setStatus(
+              `Chartmetric sync complete: ${result.profiles_count || 0} profile(s) from ${result.requests_made || 0} request(s)`
+            );
+            await refreshData();
+          } catch (error) {
+            setStatus(`Chartmetric sync failed: ${error.message}`);
+          } finally {
+            setChartmetricSyncLoading(false);
+          }
+        }
+
         async function submitSong(event) {
           event.preventDefault();
+          if (isCreatingSong) {
+            return;
+          }
+
+          if (!integrationStatus.spotify_credentials_configured) {
+            setStatus("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env, then restart uvicorn.");
+            return;
+          }
+
           try {
-            setStatus("Creating song profile...");
-            await request("/api/songs", {
+            if (!songForm.spotify_input.trim()) {
+              setStatus("Paste a Spotify track link or ISRC first");
+              return;
+            }
+
+            setIsCreatingSong(true);
+            setStatus("Fetching Spotify metadata and creating song profile...");
+            const result = await request("/api/songs/from-spotify", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(songForm),
             });
-            setSongForm({ title: "", spotify_link: "", release_date: "" });
-            setStatus("Song profile created");
+            setSongForm({ spotify_input: "" });
+            setStatus(
+              `Song profile created: ${result.song?.title || "Track"} (${result.song?.release_date || "n/a"})`
+            );
             await refreshData();
           } catch (error) {
+            if ((error.message || "").includes("Spotify API credentials are missing")) {
+              setStatus("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env, then restart uvicorn.");
+              return;
+            }
             setStatus(`Song creation failed: ${error.message}`);
+          } finally {
+            setIsCreatingSong(false);
           }
         }
 
         async function submitCsv(event) {
           event.preventDefault();
           if (!csvUpload.songId || !csvUpload.file) {
-            setStatus("Choose a song and CSV file first");
+            setStatus("Choose a song and file first");
             return;
           }
 
           try {
-            setStatus("Uploading and parsing CSV...");
+            setStatus("Uploading file...");
             const formData = new FormData();
             formData.append("file", csvUpload.file);
             const result = await request(`/api/songs/${csvUpload.songId}/upload-csv`, {
@@ -114,12 +248,16 @@
               body: formData,
             });
             const warningCount = result.warnings ? result.warnings.length : 0;
-            setStatus(`CSV processed: ${result.rows_loaded} rows (${warningCount} warnings)`);
+            if (result.ingestion_type === "document") {
+              setStatus(`Document indexed for chat (${result.source_format}) with ${warningCount} warnings`);
+            } else {
+              setStatus(`Metrics processed: ${result.rows_loaded} rows (${warningCount} warnings)`);
+            }
             setCsvUpload((current) => ({ ...current, file: null }));
             document.getElementById("csv-file-input").value = "";
             await refreshData();
           } catch (error) {
-            setStatus(`CSV upload failed: ${error.message}`);
+            setStatus(`Upload failed: ${error.message}`);
           }
         }
 
@@ -138,6 +276,31 @@
             await refreshData();
           } catch (error) {
             setStatus(`Report generation failed: ${error.message}`);
+          }
+        }
+
+        async function deleteSong(song) {
+          if (!song?.id) {
+            return;
+          }
+          const shouldDelete = window.confirm(`Delete ${song.title}? This also removes linked uploads and reports.`);
+          if (!shouldDelete) {
+            return;
+          }
+
+          try {
+            setDeletingSongId(song.id);
+            setStatus(`Deleting ${song.title}...`);
+            await request(`/api/songs/${song.id}`, { method: "DELETE" });
+            if (selectedPreview) {
+              setSelectedPreview("");
+            }
+            setStatus(`${song.title} deleted`);
+            await refreshData();
+          } catch (error) {
+            setStatus(`Delete failed: ${error.message}`);
+          } finally {
+            setDeletingSongId(null);
           }
         }
 
@@ -193,11 +356,7 @@
           <div className="page-shell">
             <header className="hero">
               <div>
-                <p className="kicker">Local Analytics Studio</p>
                 <h1>Music Release Reporter</h1>
-                <p className="hero-subtitle">
-                  Upload campaign CSVs, generate executive-ready PDFs, and query historical reports with Cohere-backed chat.
-                </p>
               </div>
               <div className="status-pill">{status}</div>
             </header>
@@ -205,31 +364,24 @@
             <main className="grid-layout">
               <section className="panel">
                 <h2>Add Song</h2>
+                {!integrationStatus.spotify_credentials_configured && (
+                  <p className="panel-caption">Spotify credentials are not configured. Song auto-fill is currently disabled.</p>
+                )}
                 <form onSubmit={submitSong} className="form-stack">
                   <input
-                    placeholder="Song title"
-                    value={songForm.title}
-                    onChange={(event) => setSongForm({ ...songForm, title: event.target.value })}
+                    placeholder="spotify link, uri, track id, ISRC, or search query"
+                    value={songForm.spotify_input}
+                    onChange={(event) => setSongForm({ ...songForm, spotify_input: event.target.value })}
                     required
                   />
-                  <input
-                    placeholder="Spotify link"
-                    value={songForm.spotify_link}
-                    onChange={(event) => setSongForm({ ...songForm, spotify_link: event.target.value })}
-                    required
-                  />
-                  <input
-                    type="date"
-                    value={songForm.release_date}
-                    onChange={(event) => setSongForm({ ...songForm, release_date: event.target.value })}
-                    required
-                  />
-                  <button type="submit">Create Song</button>
+                  <button type="submit" disabled={isCreatingSong || !integrationStatus.spotify_credentials_configured}>
+                    {isCreatingSong ? "Adding..." : "Add Song"}
+                  </button>
                 </form>
               </section>
 
               <section className="panel">
-                <h2>Upload CSV</h2>
+                <h2>Upload Metrics / Docs</h2>
                 <form onSubmit={submitCsv} className="form-stack">
                   <select
                     value={csvUpload.songId}
@@ -246,11 +398,11 @@
                   <input
                     id="csv-file-input"
                     type="file"
-                    accept=".csv"
+                    accept=".csv,.xlsx,.xls,.pdf,.doc,.docx,.docs"
                     onChange={(event) => setCsvUpload({ ...csvUpload, file: event.target.files?.[0] || null })}
                     required
                   />
-                  <button type="submit">Upload Metrics</button>
+                  <button type="submit">upload data.</button>
                 </form>
               </section>
 
@@ -277,6 +429,7 @@
                     <article key={song.id} className="song-card">
                       <div>
                         <h3>{song.title}</h3>
+                        <p className="song-meta">Artist: {song.artist_name || "Unknown"}</p>
                         <p className="song-meta">Release: {song.release_date}</p>
                         <p className="song-meta">Spotify: {song.spotify_link}</p>
                         {song.next_report && (
@@ -285,9 +438,146 @@
                           </p>
                         )}
                       </div>
-                      <button onClick={() => generateReport(song.id)}>Generate Due Report</button>
+                      <div className="song-actions">
+                        <button className="generate-report-link" onClick={() => generateReport(song.id)}>
+                          Generate report
+                        </button>
+                        <button
+                          className="delete-song-btn"
+                          onClick={() => deleteSong(song)}
+                          disabled={deletingSongId === song.id}
+                        >
+                          {deletingSongId === song.id ? "Deleting..." : "Delete"}
+                        </button>
+                      </div>
                     </article>
                   ))}
+                </div>
+              </section>
+
+              <section className="panel panel-wide">
+                <h2>Spotify Charts Sync</h2>
+                <p className="panel-caption">
+                  Paste one chart alias or URL per line (optional). Leave blank for default global daily + weekly charts.
+                </p>
+                <form onSubmit={runChartSync} className="form-stack">
+                  <textarea
+                    className="chart-input"
+                    placeholder={"regional-global-weekly\nregional-global-daily\nhttps://charts.spotify.com/charts/view/regional-global-weekly/latest"}
+                    value={chartRefsInput}
+                    onChange={(event) => setChartRefsInput(event.target.value)}
+                  />
+                  <button type="submit" disabled={chartSyncLoading}>
+                    {chartSyncLoading ? "Syncing..." : "Sync Charts"}
+                  </button>
+                </form>
+
+                <div className="chart-grid">
+                  <div>
+                    <h3>Song Insights</h3>
+                    {chartSongSummaries.length === 0 && (
+                      <p className="empty">Run chart sync to generate chart appearance insights.</p>
+                    )}
+                    <div className="chart-list">
+                      {chartSongSummaries.map((item) => (
+                        <article key={item.song_id} className="chart-item">
+                          <p className="chart-item-title">{item.song_title}</p>
+                          <p className="chart-item-meta">Appearances: {item.appearance_count}</p>
+                          <p className="chart-item-meta">Best rank: {item.best_rank ? `#${item.best_rank}` : "n/a"}</p>
+                          <p className="chart-item-meta">
+                            Window: {item.first_chart_date || "n/a"} to {item.latest_chart_date || "n/a"}
+                          </p>
+                          <p className="chart-item-meta">Charts: {(item.charts || []).join(", ") || "n/a"}</p>
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3>Matched Entries</h3>
+                    {chartAppearances.length === 0 && <p className="empty">No chart appearances stored yet.</p>}
+                    <div className="chart-list">
+                      {chartAppearances.slice(0, 50).map((item) => (
+                        <article key={item.id} className="chart-item">
+                          <p className="chart-item-title">{item.song_title}</p>
+                          <p className="chart-item-meta">
+                            {item.chart_date} | #{item.rank || "n/a"} | {item.chart_alias}
+                          </p>
+                          <p className="chart-item-meta">Track: {item.track_name || "n/a"}</p>
+                          <p className="chart-item-meta">Artists: {item.artist_names || "n/a"}</p>
+                        </article>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {chartWarnings.length > 0 && (
+                  <div className="chart-warning-box">
+                    <strong>Sync Warnings</strong>
+                    <ul>
+                      {chartWarnings.slice(0, 8).map((warning, index) => (
+                        <li key={index}>{warning}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </section>
+
+              <section className="panel panel-wide">
+                <h2>Chartmetric Insights (Apify)</h2>
+                <p className="panel-caption">
+                  Pull artist-level metrics such as track counts and audience signals using your Apify Chartmetric actor token.
+                </p>
+                {!integrationStatus.apify_token_configured && (
+                  <p className="panel-caption">APIFY_API_TOKEN is not configured. Add it in .env to enable this sync.</p>
+                )}
+                <form onSubmit={runChartmetricSync} className="form-stack chartmetric-actions">
+                  <button type="submit" disabled={chartmetricSyncLoading || !integrationStatus.apify_token_configured}>
+                    {chartmetricSyncLoading ? "Syncing..." : "Sync Chartmetric"}
+                  </button>
+                </form>
+
+                {chartmetricWarnings.length > 0 && (
+                  <div className="chart-warning-box">
+                    <strong>Chartmetric Warnings</strong>
+                    <ul>
+                      {chartmetricWarnings.slice(0, 8).map((warning, index) => (
+                        <li key={index}>{warning}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="chart-list chartmetric-list">
+                  {chartmetricProfiles.length === 0 && (
+                    <p className="empty">No Chartmetric profiles yet. Run sync to fetch artist metrics.</p>
+                  )}
+                  {chartmetricProfiles.map((profile) => {
+                    const metrics = profile.metrics || {};
+                    const extracted = metrics.extracted_metrics || {};
+                    const metricPairs = Object.entries(extracted).slice(0, 10);
+
+                    return (
+                      <article key={profile.song_id} className="chart-item">
+                        <p className="chart-item-title">{profile.song_title}</p>
+                        <p className="chart-item-meta">Keyword: {profile.keyword || "n/a"}</p>
+                        <p className="chart-item-meta">
+                          Track estimate: {metrics.track_number_estimate !== null && metrics.track_number_estimate !== undefined
+                            ? metrics.track_number_estimate
+                            : "n/a"}
+                        </p>
+                        <p className="chart-item-meta">Fetched: {new Date(profile.fetched_at).toLocaleString()}</p>
+
+                        <div className="metric-grid">
+                          {metricPairs.map(([key, value]) => (
+                            <span key={key} className="metric-pill">
+                              {key}: {String(value)}
+                            </span>
+                          ))}
+                        </div>
+                      </article>
+                    );
+                  })}
                 </div>
               </section>
 
@@ -300,10 +590,18 @@
                       <button
                         key={report.id}
                         className="report-item"
-                        onClick={() => setSelectedPreview(report.pdf_url || "")}
+                        onClick={() => {
+                          if (!report.pdf_url) {
+                            setStatus("That report file is missing locally. Generate the report again.");
+                            return;
+                          }
+                          setSelectedPreview(report.pdf_url);
+                        }}
+                        disabled={!report.pdf_url}
                       >
                         <span>{report.song_title}</span>
                         <span>{report.report_label}</span>
+                        <span>{report.pdf_url ? "Ready" : "Missing file - regenerate"}</span>
                         <span>{new Date(report.generated_at).toLocaleString()}</span>
                       </button>
                     ))}

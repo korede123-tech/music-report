@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable
+import difflib
+import re
+import xml.etree.ElementTree as ET
+import zipfile
 
 from pypdf import PdfReader
 import requests
@@ -16,6 +20,29 @@ LIVE_MODEL_CANDIDATES = [
 ]
 
 
+CHAT_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "what",
+    "when",
+    "where",
+    "which",
+    "how",
+    "from",
+    "into",
+    "about",
+    "your",
+    "their",
+    "data",
+    "report",
+    "reports",
+}
+
+
 def extract_pdf_text(pdf_path: Path) -> str:
     try:
         reader = PdfReader(str(pdf_path))
@@ -25,6 +52,74 @@ def extract_pdf_text(pdf_path: Path) -> str:
         return "\n".join(chunks)
     except Exception:
         return ""
+
+
+def extract_docx_text(docx_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(docx_path) as archive:
+            if "word/document.xml" not in archive.namelist():
+                return ""
+            xml_payload = archive.read("word/document.xml")
+
+        root = ET.fromstring(xml_payload)
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        fragments = [
+            node.text
+            for node in root.findall(".//w:t", namespace)
+            if node.text and node.text.strip()
+        ]
+        return "\n".join(fragments)
+    except Exception:
+        return ""
+
+
+def _extract_plaintext_fallback(file_path: Path) -> str:
+    try:
+        raw = file_path.read_bytes()
+    except Exception:
+        return ""
+
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            decoded = raw.decode(encoding, errors="ignore")
+            break
+        except Exception:
+            decoded = ""
+
+    if not decoded:
+        return ""
+
+    lines = []
+    for line in decoded.splitlines():
+        cleaned = " ".join(line.split())
+        if len(cleaned) >= 8:
+            lines.append(cleaned)
+    if not lines:
+        return ""
+    return "\n".join(lines[:400])
+
+
+def extract_document_text(file_path: Path) -> tuple[str, list[str]]:
+    suffix = file_path.suffix.lower()
+    warnings: list[str] = []
+
+    if suffix == ".pdf":
+        text = extract_pdf_text(file_path)
+    elif suffix == ".docx":
+        text = extract_docx_text(file_path)
+    elif suffix in {".doc", ".docs"}:
+        text = _extract_plaintext_fallback(file_path)
+        if not text:
+            warnings.append(
+                "Uploaded document saved, but automatic text extraction for .doc/.docs is limited. "
+                "Use .docx or .pdf for best indexing results."
+            )
+    else:
+        raise ValueError("Unsupported document format. Use .pdf, .doc, .docx, or .docs")
+
+    if not text.strip():
+        warnings.append("No readable text was extracted from this document.")
+    return text, warnings
 
 
 def _dedupe_docs(docs: Iterable[dict]) -> list[dict]:
@@ -52,8 +147,73 @@ def _dedupe_docs(docs: Iterable[dict]) -> list[dict]:
     return unique_docs
 
 
-def _build_context(docs: Iterable[dict], song_summaries: Iterable[dict], max_chars: int = 12_000) -> str:
+def _query_terms(question: str) -> list[str]:
+    tokens = [term.lower() for term in re.findall(r"[a-zA-Z0-9]+", question)]
+    filtered = [term for term in tokens if len(term) > 2 and term not in CHAT_STOPWORDS]
+    if filtered:
+        return filtered
+    return [term for term in tokens if len(term) > 2]
+
+
+def _extract_relevant_preview(content: str, terms: list[str], max_chars: int = 1400) -> str:
+    compact = " ".join(content.split())
+    if not compact:
+        return ""
+
+    if not terms:
+        return compact[:max_chars]
+
+    lowered = compact.lower()
+    compact_tokens = set(re.findall(r"[a-zA-Z0-9]+", lowered))
+    expanded_terms: list[str] = []
+
+    for term in terms:
+        expanded_terms.append(term)
+        if term in compact_tokens:
+            continue
+        close = difflib.get_close_matches(term, compact_tokens, n=1, cutoff=0.84)
+        if close:
+            expanded_terms.append(close[0])
+
+    snippets: list[str] = []
+    seen_windows: set[tuple[int, int]] = set()
+    for term in expanded_terms[:8]:
+        index = lowered.find(term)
+        if index < 0:
+            continue
+
+        start = max(0, index - 180)
+        end = min(len(compact), index + 340)
+        key = (start // 50, end // 50)
+        if key in seen_windows:
+            continue
+        seen_windows.add(key)
+
+        snippet = compact[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(compact):
+            snippet = snippet + "..."
+        snippets.append(snippet)
+
+        if len(" ".join(snippets)) >= max_chars:
+            break
+
+    if not snippets:
+        return compact[:max_chars]
+
+    merged = "\n".join(snippets)
+    return merged[:max_chars]
+
+
+def _build_context(
+    docs: Iterable[dict],
+    song_summaries: Iterable[dict],
+    question: str,
+    max_chars: int = 12_000,
+) -> str:
     deduped_docs = _dedupe_docs(docs)
+    question_terms = _query_terms(question)
     sections: list[str] = ["Indexed Song Summaries:"]
 
     for song in song_summaries:
@@ -63,7 +223,7 @@ def _build_context(docs: Iterable[dict], song_summaries: Iterable[dict], max_cha
 
     sections.append("\nIndexed Report Content:")
     for doc in deduped_docs:
-        preview = (doc.get("content") or "")[:1400]
+        preview = _extract_relevant_preview(str(doc.get("content") or ""), question_terms, max_chars=1400)
         sections.append(f"\nTitle: {doc.get('title', '')}\nSource: {doc.get('source_path', '')}\nContent: {preview}")
 
     context = "\n".join(sections)
@@ -91,7 +251,7 @@ def _fallback_answer(question: str, docs: Iterable[dict]) -> str:
     snippets: list[str] = []
     for doc in deduped_docs[:2]:
         content = doc.get("content") or ""
-        preview = content[:320]
+        preview = _extract_relevant_preview(content, _query_terms(question), max_chars=320)
         snippets.append(f"[{doc.get('title', 'Document')}] {preview}")
 
     if not snippets:
@@ -196,13 +356,14 @@ class CohereChatbot:
         return "", self._response_error(response)
 
     def ask(self, question: str, docs: list[dict], song_summaries: list[dict]) -> str:
-        context = _build_context(docs, song_summaries)
+        context = _build_context(docs, song_summaries, question=question)
         if not self.api_key:
             return _fallback_answer(question, docs)
 
         prompt = (
             "You are a music campaign analyst assistant. Use the context to answer the question. "
-            "If data is missing, say what is missing. Keep answers concise and factual.\n\n"
+            "Prioritize exact values from report snippets when available. "
+            "If data is missing, say exactly what is missing. Keep answers concise and factual.\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {question}"
         )

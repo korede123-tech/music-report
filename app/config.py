@@ -37,6 +37,13 @@ class Settings:
 
     cohere_api_key: str = os.getenv("COHERE_API_KEY", "")
     cohere_model: str = os.getenv("COHERE_MODEL", "command-a-03-2025")
+    spotify_client_id: str = os.getenv("SPOTIFY_CLIENT_ID", "")
+    spotify_client_secret: str = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+    spotify_charts_access_token: str = os.getenv("SPOTIFY_CHARTS_ACCESS_TOKEN", "")
+    spotify_charts_app_version: str = os.getenv("SPOTIFY_CHARTS_APP_VERSION", "0.0.0.production")
+    apify_api_token: str = os.getenv("APIFY_API_TOKEN", "")
+    apify_chartmetric_actor: str = os.getenv("APIFY_CHARTMETRIC_ACTOR", "canadesk~chartmetric")
+    apify_user_id: str = os.getenv("APIFY_USER_ID", "")
 
     def __post_init__(self) -> None:
         runtime_root = _runtime_root(self.base_dir)
